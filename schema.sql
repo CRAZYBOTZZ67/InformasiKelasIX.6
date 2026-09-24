@@ -3,13 +3,17 @@ create extension if not exists pgcrypto;
 
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
-  username text unique not null check (username in ('Rizky','Chalista','Syakina','Nadira')),
+  username text unique not null check (username ~ '^[A-Za-z0-9_.-]{3,30}$'),
   display_name text not null,
   avatar_url text,
   bio text default '',
   role text not null default 'user' check (role in ('admin','user')),
   created_at timestamptz not null default now()
 );
+
+-- Upgrade existing installations that used the old four-name restriction.
+alter table public.profiles drop constraint if exists profiles_username_check;
+alter table public.profiles add constraint profiles_username_check check (username ~ '^[A-Za-z0-9_.-]{3,30}$');
 
 create table if not exists public.conversations (
   id uuid primary key default gen_random_uuid(),

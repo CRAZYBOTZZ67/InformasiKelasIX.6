@@ -2,6 +2,8 @@ const json = (res, status, body) => {
   res.status(status).setHeader('Content-Type','application/json').end(JSON.stringify(body));
 };
 
+const validUsername = value => /^[A-Za-z0-9_.-]{3,30}$/.test(value);
+
 async function sbFetch(url, key, path, options = {}) {
   const r = await fetch(`${url}/rest/v1/${path}`, {
     ...options,
@@ -17,51 +19,69 @@ async function sbFetch(url, key, path, options = {}) {
   return { r, data };
 }
 
-export default async function handler(req, res) {
-  if (req.method !== 'POST') return json(res, 405, {error:'Method not allowed'});
+async function requireAdmin(req, res) {
   const url = process.env.SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !serviceKey) return json(res, 500, {error:'Supabase server environment belum lengkap'});
+  const anonKey = process.env.SUPABASE_ANON_KEY || serviceKey;
+  if (!url || !serviceKey) { json(res, 500, {error:'Supabase server environment belum lengkap'}); return null; }
 
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (!token) return json(res, 401, {error:'Token login diperlukan'});
+  if (!token) { json(res, 401, {error:'Token login diperlukan'}); return null; }
 
-  const userResp = await fetch(`${url}/auth/v1/user`, {
-    headers: { apikey: process.env.SUPABASE_ANON_KEY || serviceKey, Authorization:`Bearer ${token}` }
-  });
-  if (!userResp.ok) return json(res, 401, {error:'Sesi login tidak valid'});
+  const userResp = await fetch(`${url}/auth/v1/user`, {headers:{apikey:anonKey, Authorization:`Bearer ${token}`}});
+  if (!userResp.ok) { json(res, 401, {error:'Sesi login tidak valid'}); return null; }
   const authUser = await userResp.json();
+  const check = await sbFetch(url, serviceKey, `profiles?id=eq.${encodeURIComponent(authUser.id)}&select=id,username,role&limit=1`);
+  const profile = check.data?.[0];
+  if (!profile || profile.role !== 'admin') { json(res, 403, {error:'Akses admin diperlukan'}); return null; }
+  return {url,serviceKey,authUser,profile};
+}
 
-  const adminCheck = await sbFetch(url, serviceKey, `profiles?id=eq.${encodeURIComponent(authUser.id)}&select=id,username,role&limit=1`);
-  const profile = adminCheck.data?.[0];
-  if (!profile || profile.role !== 'admin') return json(res, 403, {error:'Hanya admin yang boleh mengelola akun'});
-
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return json(res, 405, {error:'Method not allowed'});
+  const ctx = await requireAdmin(req, res);
+  if (!ctx) return;
+  const {url,serviceKey} = ctx;
   const body = req.body || {};
-  const username = String(body.username || '').trim();
-  const password = String(body.password || '');
-  if (!username || !password) return json(res, 400, {error:'Username dan password wajib diisi'});
+  const action = String(body.action || 'create');
 
-  const allowed = ['Rizky','Chalista','Syakina','Nadira'];
-  if (!allowed.includes(username)) return json(res, 400, {error:'Akun hanya boleh Rizky, Chalista, Syakina, atau Nadira'});
+  if (action === 'create') {
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+    const role = body.role === 'admin' ? 'admin' : 'user';
+    if (!validUsername(username)) return json(res,400,{error:'Nama akun 3-30 karakter: huruf, angka, titik, garis bawah, atau strip.'});
+    if (password.length < 8) return json(res,400,{error:'Password minimal 8 karakter.'});
+    const exists = await sbFetch(url,serviceKey,`profiles?username=eq.${encodeURIComponent(username)}&select=id&limit=1`);
+    if (exists.data?.length) return json(res,409,{error:'Nama akun sudah dipakai.'});
+    const email = `${username.toLowerCase()}@ix6.local`;
+    const create = await fetch(`${url}/auth/v1/admin/users`,{method:'POST',headers:{apikey:serviceKey,Authorization:`Bearer ${serviceKey}`,'Content-Type':'application/json'},body:JSON.stringify({email,password,email_confirm:true,user_metadata:{username}})});
+    const created = await create.json().catch(()=>({}));
+    if (!create.ok) return json(res,create.status,{error:created.msg||created.message||'Gagal membuat akun'});
+    const ins = await sbFetch(url,serviceKey,'profiles',{method:'POST',headers:{Prefer:'return=representation'},body:JSON.stringify({id:created.id,username,display_name:username,role})});
+    if (!ins.r.ok) return json(res,500,{error:'Akun dibuat tetapi profile gagal disimpan.'});
+    return json(res,200,{ok:true,user:{id:created.id,username,role}});
+  }
 
-  const countResp = await sbFetch(url, serviceKey, 'profiles?select=id&limit=10');
-  if (Array.isArray(countResp.data) && countResp.data.length >= 4) return json(res, 409, {error:'Batas maksimal 4 akun sudah tercapai'});
+  if (action === 'set-role') {
+    const userId = String(body.userId || '');
+    const role = body.role === 'admin' ? 'admin' : 'user';
+    if (!userId) return json(res,400,{error:'User tidak valid'});
+    if (userId === ctx.authUser.id && role !== 'admin') return json(res,400,{error:'Admin terakhir tidak boleh menurunkan role dirinya sendiri.'});
+    const upd = await sbFetch(url,serviceKey,`profiles?id=eq.${encodeURIComponent(userId)}`,{method:'PATCH',headers:{Prefer:'return=representation'},body:JSON.stringify({role})});
+    if (!upd.r.ok) return json(res,upd.r.status,{error:upd.data?.message||'Gagal mengubah role'});
+    return json(res,200,{ok:true});
+  }
 
-  const email = `${username.toLowerCase()}@ix6.local`;
-  const create = await fetch(`${url}/auth/v1/admin/users`, {
-    method:'POST',
-    headers:{apikey:serviceKey, Authorization:`Bearer ${serviceKey}`, 'Content-Type':'application/json'},
-    body:JSON.stringify({email,password,email_confirm:true,user_metadata:{username}})
-  });
-  const created = await create.json().catch(()=>({}));
-  if (!create.ok) return json(res, create.status, {error:created.msg || created.message || 'Gagal membuat akun'});
+  if (action === 'reset-password') {
+    const userId = String(body.userId || '');
+    const password = String(body.password || '');
+    if (!userId || password.length < 8) return json(res,400,{error:'User valid dan password minimal 8 karakter diperlukan.'});
+    const r = await fetch(`${url}/auth/v1/admin/users/${encodeURIComponent(userId)}`,{method:'PUT',headers:{apikey:serviceKey,Authorization:`Bearer ${serviceKey}`,'Content-Type':'application/json'},body:JSON.stringify({password})});
+    const data = await r.json().catch(()=>({}));
+    if (!r.ok) return json(res,r.status,{error:data.msg||data.message||'Gagal mengubah password'});
+    return json(res,200,{ok:true});
+  }
 
-  const profileInsert = await sbFetch(url, serviceKey, 'profiles', {
-    method:'POST',
-    headers:{Prefer:'return=representation'},
-    body:JSON.stringify({id:created.id,username,display_name:username,role:'user'})
-  });
-  if (!profileInsert.r.ok) return json(res, 500, {error:'Auth berhasil, tetapi profile gagal dibuat', detail:profileInsert.data});
-  return json(res, 200, {ok:true, user:{id:created.id,username,email}});
+  return json(res,400,{error:'Aksi admin tidak dikenal'});
 }
